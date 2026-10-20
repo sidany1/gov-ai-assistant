@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>政务智能助手</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; }
+  #chat { border: 1px solid #e0e0e0; border-radius: 12px; padding: 16px; min-height: 320px; margin-bottom: 12px; background: #fafafa; }
+  .msg { margin: 10px 0; line-height: 1.6; }
+  .user { color: #1a73e8; }
+  .tools { font-size: 12px; color: #888; margin-top: 6px; }
+  .tag { display: inline-block; background: #e8f0fe; color: #1a73e8; border-radius: 6px; padding: 2px 8px; margin-right: 6px; }
+  input { width: 76%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+  button { padding: 10px 18px; background: #1a73e8; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <h3>政务智能助手（AI Agent 演示）</h3>
+  <div id="chat"></div>
+  <input id="q" placeholder="输入问题，如：线下学时怎么申报？">
+  <button onclick="ask()">发送</button>
+
+<script>
+  async function ask() {
+    const input = document.getElementById('q');
+    const q = input.value.trim();
+    if (!q) return;
+    const chat = document.getElementById('chat');
+
+    // 1. 先把用户问题显示出来
+    chat.innerHTML += `<div class="msg user">🙋 ${q}</div>`;
+    input.value = '';
+
+    // 2. loading：调大模型要等几秒，不然以为卡死
+    const loading = document.createElement('div');
+    loading.className = 'msg';
+    loading.textContent = '思考中...';
+    chat.appendChild(loading);
+
+    try {
+      // 3. 调用后端 /agent（同源，所以用相对路径 /agent）
+      const res = await fetch(`/agent?query=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      loading.remove();
+
+      // 4. 把"调用了哪些工具"渲染成蓝色小标签——这是演示亮点
+      const tools = (data.tools_called || [])
+        .map(t => `<span class="tag">${t}</span>`).join('');
+
+      chat.innerHTML += `<div class="msg">🤖 ${data.answer}
+        <div class="tools">🛠 调用工具：${tools || '无（直接回答）'}</div></div>`;
+      chat.scrollTop = chat.scrollHeight;
+    } catch (e) {
+      loading.remove();
+      chat.innerHTML += `<div class="msg">出错了：${e}</div>`;
+    }
+  }
+</script>
+</body>
+</html>
