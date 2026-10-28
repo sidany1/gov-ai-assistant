@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI
 import os
@@ -16,7 +17,9 @@ app = FastAPI(title="政务智能助手 API", version="0.1")
 
 
 # === 全局初始化：uvicorn启动时之跑一次 ===
-db = chromadb.PersistentClient(path="./chroma_db")
+# 用 __file__ 定位，数据库路径和"在哪个目录启动"无关
+DB_PATH = Path(__file__).resolve().parent / "chroma_db"
+db = chromadb.PersistentClient(path=str(DB_PATH))
 bge_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
    model_name="BAAI/bge-small-zh-v1.5" )
 table = db.get_or_create_collection("text_index_bge2",embedding_function= bge_ef)
@@ -57,23 +60,23 @@ class LLMError(Exception):
     pass
 
 def get_current_time():
-    current_time = datetime.now()
-    return current_time.strftime("%Y-%m-%d %H:%M:%S 星期%w")
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    s = "一二三四五六日"
+    current_week = s[datetime.now().weekday()]
+    return str(current_time)+" 星期"+str(current_week)
 
 def search_knowledge_base(query,n:int=2):
-    results = table.query(query_texts=[query],n_results=n)
-    metadata = []
-    distance = []
-    document = []
-    for meta,dist,docu in zip(results["metadatas"][0],results["distances"][0],results["documents"][0]):
+    query_results = table.query(query_texts=[query],n_results=n)
+    results =[]
+    print(query_results)
+    for meta,dist,docu in zip(query_results["metadatas"][0],query_results["distances"][0],query_results["documents"][0]):
         if dist<MAX_DISTANCE:
-            metadata.append(meta)
-            distance.append(dist)
-            document.append(docu)
-    if not document:
-        return "未检索到相关信息",[]
-    text =  "\n\n".join(f"（{n+1}）{d}"for n,d in enumerate(document))
-    return text , metadata
+            result ={"text": docu, "source": meta["source"], "page": meta["page"], "distance": dist}
+            results.append(result)
+    if not results:
+        return [{"text": "未检索到相关信息", "source": None, "page": None, "distance": None}]
+
+    return results
 
 def get_chat(messages,tools=None,model:str = "deepseek-chat",max_retries:int=3):
     last_reason = "unknown"
@@ -105,9 +108,9 @@ def get_chat(messages,tools=None,model:str = "deepseek-chat",max_retries:int=3):
         except APIError as e:
             # 其他API错误
             print(f"API错误：{e}")
-            raise RuntimeError(f"模型调用失败：{e}" ) from e
+            raise LLMError(f"模型调用失败：{e}" ) from e
     print("达到最大重试次数，请求失败")
-    raise RuntimeError(f"LLM 调用失败，已重试{max_retries}次，最后问题{last_reason}")
+    raise LLMError(f"LLM 调用失败，已重试{max_retries}次，最后问题{last_reason}")
 
 
 def run_tool(call):
@@ -117,8 +120,11 @@ def run_tool(call):
         if call.function.name == "search_knowledge_base":
             argu = json.loads(call.function.arguments)
             query = argu["query"]
-            result,_ = search_knowledge_base(query)
-            return result
+            results = search_knowledge_base(query)
+            if not results[0]["distance"]:
+                return results[0]["text"]
+            return "\n\n".join(f'（{n}）{res["text"]}\n来源：{res["source"]},页数：{res["page"]},距离:{res["distance"]}' for n,res in enumerate(results))
+
         return f"{call.function.name}工具名不存在"
     except json.JSONDecodeError:
         return (
@@ -127,8 +133,8 @@ def run_tool(call):
     except Exception as e:
         return f"错误：工具执行失败：{e}"
 
-@app.exception_handler(RuntimeError)
-async def llm_error_handler(request,exc:RuntimeError):
+@app.exception_handler(LLMError)
+async def llm_error_handler(request,exc:LLMError):
     return JSONResponse(status_code=503,content={"error":"服务暂时不可用 ，请过段时间重试","detail":str(exc)})
 
 
@@ -138,22 +144,28 @@ async def llm_error_handler(request,exc:RuntimeError):
 @app.get("/ask")
 def ask(q:str,n:int=2):
 
-    result,metadata = search_knowledge_base(q,n)
+    result = search_knowledge_base(q,n)
+    if not result[0]["distance"]:
+        return {"question": q,
+            "answer": result[0]["text"],
+            "sources": None}
+    referenceContext ="\n\n".join(f'（{n}）{res["text"]}\n来源：{res["source"]},页数：{res["page"]},距离:{res["distance"]}' for n,res in enumerate(result))
+
     context = f"""用户的问题：{q}
         如果参考资料里面没有答案，请回复无法回答
-        参考内容：{result}"""
+        参考内容：{referenceContext}"""
     messages = [{"role": "system", "content": "你是一个政务问答系统"},
                 {"role": "user", "content": context}]
     chat = get_chat(messages=messages)
     return {"question": q,
             "answer": chat.choices[0].message.content,
-            "sources": metadata}
+            "sources": referenceContext}
 
 
 @app.get("/agent")
 def get_agent(query: str):
     messages = [
-        {"role": "system", "content": "你是一个政务问答助手"},
+        {"role": "system", "content": "你是一个政策规划问答助手"},
         {"role": "user", "content": query}
     ]
     trace = []
@@ -167,9 +179,9 @@ def get_agent(query: str):
                 trace.append(call.function.name)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
         else:
-            return {"question": query, "answer": msg.content, "tools_called": trace,"steps": max + 1}
+            return {"question": query, "answer": msg.content, "tools_called": trace,"llm_rounds": max + 1}
 
-    raise RuntimeError(f"超过最大步数 {MAX_STEPS}，模型可能陷入循环")
+    raise LLMError(f"超过最大步数 {MAX_STEPS}，模型可能陷入循环")
 
 @app.get("/")
 def home():
